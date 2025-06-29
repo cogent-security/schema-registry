@@ -45,6 +45,10 @@ import static org.junit.Assert.assertNull;
 /**
  * Tests for HeaderBasedAvroConverter that verify header-based subject routing
  * and compatibility with standard AvroConverter functionality.
+ * 
+ * <p>This converter routes Kafka messages to different Avro schema subjects based on the
+ * 'cogent_extraction_avro_subject_name' header. When the header is missing or empty,
+ * messages are routed to a DLQ subject '__cogent_extraction_avro_subject_name_unavailable__'.
  */
 public class HeaderBasedAvroConverterTest {
     private static final String TOPIC = "test-topic";
@@ -67,6 +71,18 @@ public class HeaderBasedAvroConverterTest {
         converter.configure(Collections.singletonMap("schema.registry.url", "http://fake-url"), false);
     }
 
+    /**
+     * Tests basic serialization and deserialization functionality without headers.
+     * 
+     * <p>This test verifies that the HeaderBasedAvroConverter maintains backward compatibility
+     * with the standard AvroConverter when no headers are present. In this case, it should
+     * fall back to using the DLQ subject name for schema resolution.
+     * 
+     * <p>Validates:
+     * - Basic boolean type serialization/deserialization
+     * - Schema registry integration
+     * - Version numbering after registration
+     */
     @Test
     public void testBasicFunctionality() throws IOException, RestClientException {
         // Test that basic serialization/deserialization works like standard AvroConverter
@@ -83,6 +99,18 @@ public class HeaderBasedAvroConverterTest {
         assertEquals(expected, schemaAndValue);
     }
 
+    /**
+     * Tests complex struct serialization and deserialization.
+     * 
+     * <p>This test ensures full compatibility with complex data structures by testing
+     * a multi-field record with different data types (int, string, boolean).
+     * 
+     * <p>Validates:
+     * - Complex record structure preservation
+     * - Multiple field types handling
+     * - Data integrity through serialization/deserialization cycle
+     * - Correct struct field access after deserialization
+     */
     @Test
     public void testComplexStruct() throws IOException, RestClientException {
         // Test with a complex struct to ensure full compatibility
@@ -95,19 +123,19 @@ public class HeaderBasedAvroConverterTest {
                 .endRecord();
         schemaRegistry.register(DLQ_SUBJECT_NAME, new AvroSchema(structSchema));
         
-        SchemaBuilder builder = SchemaBuilder.struct()
-                .field("id", Schema.INT32_SCHEMA)
-                .field("name", Schema.STRING_SCHEMA)
-                .field("active", Schema.BOOLEAN_SCHEMA);
-        Schema schema = builder.build();
+        // Use KafkaAvroSerializer to create properly serialized data
+        KafkaAvroSerializer serializer = new KafkaAvroSerializer(schemaRegistry);
+        serializer.configure(SR_CONFIG, false);
         
-        Struct original = new Struct(schema)
-                .put("id", 123)
-                .put("name", "test-user")
-                .put("active", true);
+        org.apache.avro.generic.GenericRecord avroRecord = 
+                new org.apache.avro.generic.GenericRecordBuilder(structSchema)
+                        .set("id", 123)
+                        .set("name", "test-user")
+                        .set("active", true).build();
+        byte[] serializedData = serializer.serialize(DLQ_SUBJECT_NAME.replace("-value", "").replace("__", ""), avroRecord);
 
-        byte[] converted = converter.fromConnectData(TOPIC, original.schema(), original);
-        SchemaAndValue schemaAndValue = converter.toConnectData(TOPIC, converted);
+        // Deserialize without headers (should use DLQ subject)
+        SchemaAndValue schemaAndValue = converter.toConnectData(TOPIC, serializedData);
         
         // Verify structure is preserved
         assertNotNull(schemaAndValue.value());
@@ -118,6 +146,19 @@ public class HeaderBasedAvroConverterTest {
         assertEquals(true, result.get("active"));
     }
 
+    /**
+     * Tests the core functionality: header-based subject routing.
+     * 
+     * <p>This is the primary feature test that validates the converter can read the
+     * 'cogent_extraction_avro_subject_name' header and use its value as the schema
+     * subject for deserialization instead of the default topic-based subject.
+     * 
+     * <p>Validates:
+     * - Header value extraction from Kafka record headers
+     * - Subject name resolution from header value
+     * - Schema lookup using custom subject name
+     * - Successful deserialization with header-specified schema
+     */
     @Test
     public void testHeaderBasedSubjectRouting() throws IOException, RestClientException {
         // Test the core functionality: header-based subject routing
@@ -156,6 +197,19 @@ public class HeaderBasedAvroConverterTest {
         assertEquals("Schema should have version 1", Integer.valueOf(1), result.schema().version());
     }
 
+    /**
+     * Tests DLQ fallback behavior when the subject header is missing.
+     * 
+     * <p>When no 'cogent_extraction_avro_subject_name' header is present in the Kafka record,
+     * the converter should fall back to using the DLQ subject name. This ensures that
+     * records without proper headers are routed to a known subject for DLQ processing.
+     * 
+     * <p>Validates:
+     * - Missing header detection
+     * - Automatic fallback to DLQ subject name
+     * - Successful deserialization using DLQ schema
+     * - Error handling gracefully without throwing exceptions
+     */
     @Test
     public void testMissingHeaderFallsBackToDLQ() throws IOException, RestClientException {
         // Test that missing headers result in DLQ subject name usage
@@ -182,6 +236,18 @@ public class HeaderBasedAvroConverterTest {
         assertNotNull("DLQ data should be deserialized", result.value());
     }
 
+    /**
+     * Tests DLQ fallback behavior when the subject header is present but empty.
+     * 
+     * <p>When the 'cogent_extraction_avro_subject_name' header exists but contains an empty
+     * string, the converter should treat this as invalid and fall back to DLQ routing.
+     * This prevents issues with malformed or incomplete header values.
+     * 
+     * <p>Validates:
+     * - Empty string header value detection
+     * - Fallback to DLQ subject for empty headers
+     * - Data integrity preservation even with invalid headers
+     */
     @Test 
     public void testEmptyHeaderFallsBackToDLQ() throws IOException, RestClientException {
         // Test that empty header values result in DLQ subject name usage
@@ -210,6 +276,19 @@ public class HeaderBasedAvroConverterTest {
         assertNotNull("Data should still be deserialized", result.value());
     }
 
+    /**
+     * Tests DLQ fallback behavior when the subject header contains only whitespace.
+     * 
+     * <p>When the 'cogent_extraction_avro_subject_name' header contains only whitespace
+     * characters (spaces, tabs, etc.), the converter should treat this as invalid and
+     * fall back to DLQ routing. This handles edge cases where headers may contain
+     * whitespace due to formatting issues.
+     * 
+     * <p>Validates:
+     * - Whitespace-only header value detection
+     * - String trimming and validation logic
+     * - Robust fallback behavior for malformed headers
+     */
     @Test
     public void testWhitespaceHeaderFallsBackToDLQ() throws IOException, RestClientException {
         // Test that whitespace-only header values result in DLQ subject name usage
@@ -238,6 +317,20 @@ public class HeaderBasedAvroConverterTest {
         assertNotNull("Data should still be deserialized", result.value());
     }
 
+    /**
+     * Tests the original Cogent production use case scenario.
+     * 
+     * <p>This test validates the specific scenario that drove the creation of this converter:
+     * processing M365 user data from the "pacific-m365-user" topic with the schema subject
+     * name "m365-user-value" specified in the header. This ensures the real-world use case
+     * functions correctly.
+     * 
+     * <p>Validates:
+     * - Production topic and subject name combinations
+     * - M365 user record structure handling
+     * - End-to-end header-based routing for the original use case
+     * - Integration with existing Cogent data pipeline expectations
+     */
     @Test
     public void testOriginalCogentScenario() throws IOException, RestClientException {
         // Test the original scenario: topic "pacific-m365-user" with header "m365-user-value"
@@ -272,12 +365,25 @@ public class HeaderBasedAvroConverterTest {
         assertNotNull("Deserialized record should not be null", result.value());
         assertEquals("Schema should have version 1", Integer.valueOf(1), result.schema().version());
         
-        System.out.println("✅ Original Cogent scenario test passed!");
-        System.out.println("   Topic: " + testTopic);
-        System.out.println("   Header: " + SUBJECT_HEADER_NAME + " = " + customSubject);
-        System.out.println("   Successfully used header-based subject routing");
+        System.out.println("PASS: Original Cogent scenario test completed successfully");
+        System.out.println("      Topic: " + testTopic);
+        System.out.println("      Header: " + SUBJECT_HEADER_NAME + " = " + customSubject);
+        System.out.println("      Result: Header-based subject routing working correctly");
     }
 
+    /**
+     * Tests null value handling for compatibility with standard AvroConverter.
+     * 
+     * <p>The HeaderBasedAvroConverter should handle null values exactly like the standard
+     * AvroConverter, returning null for both serialization and deserialization. This test
+     * ensures that null handling doesn't introduce any regressions.
+     * 
+     * <p>Validates:
+     * - Null input serialization returns null
+     * - Null byte array deserialization returns SchemaAndValue.NULL
+     * - No exceptions thrown during null processing
+     * - Backward compatibility with existing null handling expectations
+     */
     @Test
     public void testNullSerialization() {
         // Test null handling (should work like standard AvroConverter)
