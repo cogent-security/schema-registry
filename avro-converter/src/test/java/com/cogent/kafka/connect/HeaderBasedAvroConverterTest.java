@@ -364,11 +364,6 @@ public class HeaderBasedAvroConverterTest {
         
         assertNotNull("Deserialized record should not be null", result.value());
         assertEquals("Schema should have version 1", Integer.valueOf(1), result.schema().version());
-        
-        System.out.println("PASS: Original Cogent scenario test completed successfully");
-        System.out.println("      Topic: " + testTopic);
-        System.out.println("      Header: " + SUBJECT_HEADER_NAME + " = " + customSubject);
-        System.out.println("      Result: Header-based subject routing working correctly");
     }
 
     /**
